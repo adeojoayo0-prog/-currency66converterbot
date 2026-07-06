@@ -1,65 +1,74 @@
 import os
 import re
+import json
 import logging
-import aiohttp
-import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import requests
+from flask import Flask, request, jsonify
 
-# --- Logging ---
+# ============================================
+# LOGGING
+# ============================================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- Configuration ---
+# ============================================
+# GET ENVIRONMENT VARIABLES
+# ============================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-EXCHANGE_API_KEY = os.environ.get("EXCHANGE_API_KEY", "free")  # Get from exchangerate-api.com
-EXCHANGE_API_URL = f"https://api.exchangerate-api.com/v4/latest/"
+EXCHANGE_API_KEY = os.environ.get("EXCHANGE_API_KEY", "free")
+PORT = int(os.environ.get("PORT", 8080))
 
-# Supported currencies (for the inline keyboard)
-SUPPORTED_CURRENCIES = [
-    "USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "CNY", "INR", "BRL",
-    "ZAR", "NZD", "KRW", "SGD", "MXN", "HKD", "RUB", "TRY", "AED", "SAR",
-    "NGN", "KES", "GHS", "EGP", "MAD", "DZD", "TND", "LKR", "BDT", "PKR"
-]
+# Log the status (don't log the actual token!)
+if TELEGRAM_TOKEN:
+    logger.info("✅ TELEGRAM_TOKEN found!")
+else:
+    logger.error("❌ TELEGRAM_TOKEN NOT SET! Please add it to Railway variables.")
+    logger.error("❌ Bot will not work without TELEGRAM_TOKEN!")
 
-# --- Helper Functions ---
+# ============================================
+# CONSTANTS
+# ============================================
+EXCHANGE_API_URL = "https://api.exchangerate-api.com/v4/latest/"
 
-async def get_exchange_rates(base_currency="USD"):
-    """Fetch live exchange rates from the API."""
-    url = f"{EXCHANGE_API_URL}{base_currency}"
-    
+SUPPORTED_CURRENCIES = {
+    "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "AUD": "A$",
+    "CAD": "C$", "CHF": "Fr", "CNY": "¥", "INR": "₹", "BRL": "R$",
+    "ZAR": "R", "NZD": "NZ$", "KRW": "₩", "SGD": "S$", "MXN": "Mex$",
+    "HKD": "HK$", "RUB": "₽", "TRY": "₺", "AED": "د.إ", "SAR": "﷼",
+    "NGN": "₦", "KES": "KSh", "GHS": "GH₵", "EGP": "E£", "MAD": "د.م.",
+    "DZD": "دج", "TND": "د.ت", "LKR": "Rs", "BDT": "৳", "PKR": "₨",
+    "PHP": "₱", "THB": "฿", "VND": "₫", "IDR": "Rp", "MYR": "RM"
+}
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+
+def get_exchange_rates(base_currency="USD"):
+    """Fetch live exchange rates."""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get("rates", {})
-                else:
-                    logger.error(f"API Error: {response.status}")
-                    return None
+        url = f"{EXCHANGE_API_URL}{base_currency}"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("rates", {})
+        else:
+            logger.error(f"API Error: {response.status_code}")
+            return None
     except Exception as e:
-        logger.error(f"API Request Failed: {e}")
+        logger.error(f"API Error: {str(e)}")
         return None
 
-def format_currency(amount, currency):
-    """Format amount with currency symbol."""
-    symbols = {
-        "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "CHF": "Fr",
-        "CNY": "¥", "INR": "₹", "BRL": "R$", "RUB": "₽", "KRW": "₩",
-        "TRY": "₺", "NGN": "₦", "AED": "د.إ", "SAR": "﷼", "EGP": "E£"
-    }
-    symbol = symbols.get(currency, "")
-    return f"{symbol}{amount:,.2f}"
-
 def parse_convert_input(text):
-    """Parse user input like '100 USD to EUR' or '100 usd in eur'."""
+    """Parse conversion input."""
     patterns = [
-        r'(\d+\.?\d*)\s*([A-Za-z]{3})\s+(?:to|in|into|->)\s+([A-Za-z]{3})',
-        r'(\d+\.?\d*)\s*([A-Za-z]{3})\s*[/=]\s*([A-Za-z]{3})',
-        r'convert\s+(\d+\.?\d*)\s*([A-Za-z]{3})\s+(?:to|in|into)\s+([A-Za-z]{3})',
+        r'^(\d+\.?\d*)\s+([A-Za-z]{3})\s+(?:to|in|into|->|=>)\s+([A-Za-z]{3})$',
+        r'^(\d+\.?\d*)\s+([A-Za-z]{3})\s*[/=]\s*([A-Za-z]{3})$',
+        r'^convert\s+(\d+\.?\d*)\s+([A-Za-z]{3})\s+(?:to|in|into)\s+([A-Za-z]{3})$',
     ]
     
     for pattern in patterns:
@@ -69,264 +78,290 @@ def parse_convert_input(text):
             from_cur = match.group(2).upper()
             to_cur = match.group(3).upper()
             return amount, from_cur, to_cur
-    
     return None
 
-async def convert_currency(amount, from_currency, to_currency):
-    """Convert currency using the API."""
-    rates = await get_exchange_rates(from_currency)
-    if not rates:
-        return None
-    
-    if to_currency not in rates:
-        return None
-    
-    rate = rates[to_currency]
-    result = amount * rate
-    return result, rate
+def format_currency(amount, currency_code):
+    """Format amount with currency symbol."""
+    symbol = SUPPORTED_CURRENCIES.get(currency_code, "")
+    return f"{symbol}{amount:,.2f}" if symbol else f"{amount:.2f} {currency_code}"
 
-# --- Bot Commands ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a welcome message when the /start command is issued."""
-    welcome_text = (
-        f"💰 *Welcome to Currency66 Converter Bot!*\n\n"
-        f"I can help you convert currencies instantly using live exchange rates.\n\n"
-        f"*How to use me:*\n"
-        f"• `/convert 100 USD to EUR` - Convert currency\n"
-        f"• `/rates USD` - Show exchange rates for a currency\n"
-        f"• `/list` - Show supported currencies\n"
-        f"• `/help` - Show this help message\n\n"
-        f"*Quick Convert:* Just type `100 usd to eur` directly in the chat!\n\n"
-        f"*Supported Currencies:* 30+ major currencies including NGN, GHS, KES, and more."
-    )
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("💱 Convert Now", callback_data="convert"),
-            InlineKeyboardButton("📊 View Rates", callback_data="rates")
-        ],
-        [
-            InlineKeyboardButton("📋 Supported Currencies", callback_data="list"),
-            InlineKeyboardButton("❓ Help", callback_data="help")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        welcome_text,
-        parse_mode="Markdown",
-        reply_markup=reply_markup
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a help message."""
-    help_text = (
-        "❓ *How to use Currency66 Converter Bot*\n\n"
-        "*Commands:*\n"
-        "• `/start` - Show welcome message\n"
-        "• `/convert 100 USD to EUR` - Convert currency\n"
-        "• `/rates USD` - Show exchange rates for a base currency\n"
-        "• `/list` - Show all supported currencies\n"
-        "• `/help` - Show this help\n\n"
-        "*Quick Convert:*\n"
-        "Just type `100 usd to eur` directly in chat\n"
-        "Or `50 eur in gbp`, `25 usd -> ngn`\n\n"
-        "*Examples:*\n"
-        "• 100 USD to EUR\n"
-        "• 5000 NGN in USD\n"
-        "• Convert 200 GBP to JPY"
-    )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
-
-async def convert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the /convert command."""
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Please provide the amount and currencies.\n"
-            "*Example:* `/convert 100 USD to EUR`",
-            parse_mode="Markdown"
-        )
-        return
-    
-    try:
-        # Handle args like ["100", "USD", "to", "EUR"]
-        if len(context.args) >= 4:
-            amount = float(context.args[0])
-            from_currency = context.args[1].upper()
-            to_currency = context.args[3].upper()
-        else:
-            await update.message.reply_text(
-                "❌ Invalid format.\n"
-                "*Example:* `/convert 100 USD to EUR`",
-                parse_mode="Markdown"
-            )
-            return
-        
-        result = await perform_conversion(update, amount, from_currency, to_currency)
-        if result:
-            await update.message.reply_text(result, parse_mode="Markdown")
-            
-    except ValueError:
-        await update.message.reply_text("❌ Please enter a valid number for the amount.")
-
-async def rates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show exchange rates for a specific currency."""
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Please specify a currency.\n"
-            "*Example:* `/rates USD`",
-            parse_mode="Markdown"
-        )
-        return
-    
-    base_currency = context.args[0].upper()
-    rates = await get_exchange_rates(base_currency)
-    
-    if not rates:
-        await update.message.reply_text(
-            f"❌ Could not fetch rates for {base_currency}. Please try again later."
-        )
-        return
-    
-    # Show top 10 currencies
-    top_currencies = ["USD", "EUR", "GBP", "JPY", "NGN", "INR", "CNY", "CAD", "AUD", "CHF"]
-    response = f"📊 *Exchange Rates (Base: {base_currency})*\n\n"
-    
-    for currency in top_currencies:
-        if currency in rates:
-            rate = rates[currency]
-            response += f"• {currency}: `{rate:.4f}`\n"
-    
-    response += "\n_Showing top 10 currencies. Use /list to see all._"
-    await update.message.reply_text(response, parse_mode="Markdown")
-
-async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show all supported currencies."""
-    currencies_list = "\n".join([f"• `{c}`" for c in SUPPORTED_CURRENCIES])
-    response = f"📋 *Supported Currencies ({len(SUPPORTED_CURRENCIES)} total)*\n\n{currencies_list}"
-    await update.message.reply_text(response, parse_mode="Markdown")
-
-async def perform_conversion(update, amount, from_currency, to_currency):
-    """Perform currency conversion and return formatted result."""
-    # Validate currencies
+def perform_conversion(amount, from_currency, to_currency):
+    """Perform currency conversion."""
     if from_currency not in SUPPORTED_CURRENCIES:
-        return f"❌ Currency `{from_currency}` is not supported. Use /list to see all."
+        return None, f"Currency {from_currency} not supported"
     if to_currency not in SUPPORTED_CURRENCIES:
-        return f"❌ Currency `{to_currency}` is not supported. Use /list to see all."
+        return None, f"Currency {to_currency} not supported"
     
     if from_currency == to_currency:
-        return f"💱 {format_currency(amount, from_currency)} = {format_currency(amount, to_currency)} (same currency)"
+        return amount, 1.0, 1.0
     
-    # Get conversion
-    result = await convert_currency(amount, from_currency, to_currency)
-    if result is None:
-        return "❌ Failed to fetch exchange rates. Please try again later."
+    rates = get_exchange_rates(from_currency)
+    if not rates:
+        return None, "Failed to fetch exchange rates"
     
-    converted_amount, rate = result
-    response = (
-        f"💱 *Currency Conversion*\n\n"
-        f"`{format_currency(amount, from_currency)}` = `{format_currency(converted_amount, to_currency)}`\n\n"
-        f"📈 *Rate:* 1 {from_currency} = {rate:.4f} {to_currency}\n"
-        f"🔄 *Inverse:* 1 {to_currency} = {1/rate:.4f} {from_currency}\n\n"
-        f"🕐 *Live Rates* | Powered by ExchangeRate-API"
-    )
-    return response
+    if to_currency not in rates:
+        return None, f"Rate for {to_currency} not found"
+    
+    rate = rates[to_currency]
+    converted_amount = amount * rate
+    inverse_rate = 1 / rate if rate != 0 else 0
+    
+    return converted_amount, rate, inverse_rate
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle regular messages for quick conversion."""
-    text = update.message.text
-    parsed = parse_convert_input(text)
+def send_telegram_message(chat_id, text, parse_mode="Markdown"):
+    """Send message to Telegram."""
+    if not TELEGRAM_TOKEN:
+        logger.error("Cannot send message: TELEGRAM_TOKEN not set")
+        return False
     
-    if parsed:
-        amount, from_currency, to_currency = parsed
-        result = await perform_conversion(update, amount, from_currency, to_currency)
-        if result:
-            await update.message.reply_text(result, parse_mode="Markdown")
-    else:
-        # Check if it's just a currency code
-        if text.upper().strip() in SUPPORTED_CURRENCIES:
-            await rates_command(update, context)
-        else:
-            await update.message.reply_text(
-                "❌ I didn't understand that.\n\n"
-                "Try:\n"
-                "• `100 USD to EUR`\n"
-                "• `/convert 100 USD to EUR`\n"
-                "• `/rates USD`\n"
-                "• `/list` for supported currencies\n\n"
-                "Send /help for more info."
-            )
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode
+    }
+    
+    try:
+        response = requests.post(url, json=data, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Failed to send message: {str(e)}")
+        return False
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button callbacks."""
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    
-    if data == "convert":
-        await query.edit_message_text(
-            "💱 *Convert Currency*\n\n"
-            "Type your conversion directly in the chat, like:\n"
+def get_currency_list_text():
+    """Get formatted currency list."""
+    currencies = sorted(SUPPORTED_CURRENCIES.keys())
+    chunks = [currencies[i:i+10] for i in range(0, len(currencies), 10)]
+    text = f"📋 *Supported Currencies ({len(currencies)} total)*\n\n"
+    for chunk in chunks:
+        text += "• " + " • ".join([f"`{c}`" for c in chunk]) + "\n"
+    return text
+
+# ============================================
+# TELEGRAM WEBHOOK HANDLER
+# ============================================
+
+def handle_telegram_update(update_data):
+    """Process incoming Telegram updates."""
+    try:
+        # Extract update info
+        if "message" not in update_data:
+            return
+        
+        message = update_data["message"]
+        chat_id = message["chat"]["id"]
+        text = message.get("text", "").strip()
+        
+        if not text:
+            return
+        
+        logger.info(f"Received message from {chat_id}: {text}")
+        
+        # Handle commands
+        if text.startswith("/"):
+            command = text.split()[0].lower()
+            
+            if command == "/start":
+                response = (
+                    "💰 *Welcome to Currency66 Converter Bot!*\n\n"
+                    "I convert currencies using live exchange rates.\n\n"
+                    "*Quick Examples:*\n"
+                    "• `100 USD to EUR`\n"
+                    "• `5000 NGN in USD`\n"
+                    "• `convert 200 GBP to JPY`\n\n"
+                    "*Commands:*\n"
+                    "/convert - Convert currency\n"
+                    "/rates - Show exchange rates\n"
+                    "/list - Show all currencies\n"
+                    "/help - Show help"
+                )
+                send_telegram_message(chat_id, response)
+                
+            elif command == "/help":
+                response = (
+                    "❓ *How to Use*\n\n"
+                    "*Commands:*\n"
+                    "• `/start` - Welcome\n"
+                    "• `/convert 100 USD to EUR` - Convert\n"
+                    "• `/rates USD` - Show rates\n"
+                    "• `/list` - All currencies\n\n"
+                    "*Quick Convert:*\n"
+                    "`100 USD to EUR`\n"
+                    "`50 EUR in GBP`\n"
+                    "`25 USD -> NGN`"
+                )
+                send_telegram_message(chat_id, response)
+                
+            elif command == "/convert":
+                parts = text.split()[1:]
+                if len(parts) >= 4:
+                    try:
+                        amount = float(parts[0])
+                        from_cur = parts[1].upper()
+                        to_cur = parts[3].upper()
+                        
+                        result = perform_conversion(amount, from_cur, to_cur)
+                        if result[0] is None:
+                            response = f"❌ {result[1]}"
+                        else:
+                            converted, rate, inverse = result
+                            response = (
+                                f"💱 *Conversion*\n\n"
+                                f"{format_currency(amount, from_cur)} = {format_currency(converted, to_cur)}\n\n"
+                                f"📈 1 {from_cur} = {rate:.4f} {to_cur}\n"
+                                f"🔄 1 {to_cur} = {inverse:.4f} {from_cur}"
+                            )
+                        send_telegram_message(chat_id, response)
+                    except:
+                        send_telegram_message(chat_id, "❌ Invalid format. Use: /convert 100 USD to EUR")
+                else:
+                    send_telegram_message(chat_id, "❌ Usage: /convert <amount> <from> to <to>")
+                    
+            elif command == "/rates":
+                parts = text.split()
+                if len(parts) >= 2:
+                    base = parts[1].upper()
+                    if base not in SUPPORTED_CURRENCIES:
+                        send_telegram_message(chat_id, f"❌ {base} not supported. Use /list")
+                        return
+                    
+                    rates = get_exchange_rates(base)
+                    if not rates:
+                        send_telegram_message(chat_id, "❌ Failed to fetch rates")
+                        return
+                    
+                    response = f"📊 *Rates (Base: {base})*\n\n"
+                    top = ["USD", "EUR", "GBP", "JPY", "NGN", "INR", "CNY", "CAD", "AUD", "CHF"]
+                    count = 0
+                    for cur in top:
+                        if cur in rates and cur != base:
+                            response += f"• {cur}: `{rates[cur]:.4f}`\n"
+                            count += 1
+                    response += f"\n_Showing {count} major currencies_"
+                    send_telegram_message(chat_id, response)
+                else:
+                    send_telegram_message(chat_id, "❌ Usage: /rates USD")
+                    
+            elif command == "/list":
+                response = get_currency_list_text()
+                send_telegram_message(chat_id, response)
+            else:
+                send_telegram_message(chat_id, "❌ Unknown command. Send /help")
+            return
+        
+        # Quick conversion
+        parsed = parse_convert_input(text)
+        if parsed:
+            amount, from_cur, to_cur = parsed
+            result = perform_conversion(amount, from_cur, to_cur)
+            if result[0] is None:
+                response = f"❌ {result[1]}"
+            else:
+                converted, rate, inverse = result
+                response = (
+                    f"💱 *Conversion*\n\n"
+                    f"{format_currency(amount, from_cur)} = {format_currency(converted, to_cur)}\n\n"
+                    f"📈 1 {from_cur} = {rate:.4f} {to_cur}\n"
+                    f"🔄 1 {to_cur} = {inverse:.4f} {from_cur}"
+                )
+            send_telegram_message(chat_id, response)
+            return
+        
+        # Check if just a currency code
+        if text.upper() in SUPPORTED_CURRENCIES:
+            base = text.upper()
+            rates = get_exchange_rates(base)
+            if rates:
+                response = f"📊 *Rates (Base: {base})*\n\n"
+                top = ["USD", "EUR", "GBP", "JPY", "NGN", "INR"]
+                for cur in top:
+                    if cur in rates and cur != base:
+                        response += f"• {cur}: `{rates[cur]:.4f}`\n"
+                send_telegram_message(chat_id, response)
+            return
+        
+        # No match
+        response = (
+            "❓ I didn't understand.\n\n"
+            "*Try:*\n"
             "• `100 USD to EUR`\n"
             "• `5000 NGN in USD`\n"
-            "• `/convert 200 GBP to JPY`",
-            parse_mode="Markdown"
+            "• `/rates USD`\n"
+            "• `/list`\n\n"
+            "Send /help for more info."
         )
-    elif data == "rates":
-        await query.edit_message_text(
-            "📊 *View Exchange Rates*\n\n"
-            "Type `/rates USD` (replace USD with any currency code).\n\n"
-            "Or just type a currency code like `USD` in the chat!"
-        )
-    elif data == "list":
-        currencies_list = "\n".join([f"• `{c}`" for c in SUPPORTED_CURRENCIES])
-        response = f"📋 *Supported Currencies ({len(SUPPORTED_CURRENCIES)} total)*\n\n{currencies_list}"
-        await query.edit_message_text(response, parse_mode="Markdown")
-    elif data == "help":
-        help_text = (
-            "❓ *How to use Currency66 Converter Bot*\n\n"
-            "*Commands:*\n"
-            "• `/start` - Show welcome message\n"
-            "• `/convert 100 USD to EUR` - Convert currency\n"
-            "• `/rates USD` - Show exchange rates\n"
-            "• `/list` - Show supported currencies\n\n"
-            "*Quick Convert:*\n"
-            "Just type `100 usd to eur` directly in chat\n"
-            "Or `50 eur in gbp`\n\n"
-            "*Example:* `100 USD to NGN`"
-        )
-        await query.edit_message_text(help_text, parse_mode="Markdown")
+        send_telegram_message(chat_id, response)
+        
+    except Exception as e:
+        logger.error(f"Error handling update: {str(e)}")
 
-# --- Main Application ---
+# ============================================
+# FLASK APP
+# ============================================
 
-async def main():
-    """Start the bot."""
+app = Flask(__name__)
+
+@app.route('/', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({
+        "status": "healthy",
+        "bot": "Currency66 Converter Bot",
+        "token_set": bool(TELEGRAM_TOKEN),
+        "version": "2.0.0"
+    })
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Handle webhook from Telegram."""
     if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_TOKEN environment variable not set!")
-        return
+        return jsonify({"error": "TELEGRAM_TOKEN not set"}), 500
     
-    logger.info("Starting Currency66 Converter Bot...")
+    try:
+        update_data = request.get_json()
+        if update_data:
+            logger.info("Received webhook update")
+            handle_telegram_update(update_data)
+            return jsonify({"status": "ok"}), 200
+        return jsonify({"error": "No data"}), 400
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/setwebhook', methods=['GET'])
+def set_webhook():
+    """Set the webhook URL."""
+    if not TELEGRAM_TOKEN:
+        return jsonify({"error": "TELEGRAM_TOKEN not set"}), 500
     
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    webhook_url = f"https://{request.host}/webhook"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}"
     
-    # Add command handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("convert", convert_command))
-    app.add_handler(CommandHandler("rates", rates_command))
-    app.add_handler(CommandHandler("list", list_command))
-    
-    # Add callback handler for inline buttons
-    app.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Add message handler for quick conversions
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Start the bot
-    logger.info("Bot is polling for updates...")
-    await app.run_polling()
+    try:
+        response = requests.get(url)
+        return jsonify(response.json())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============================================
+# MAIN
+# ============================================
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    logger.info("=" * 50)
+    logger.info("Starting Currency66 Converter Bot")
+    logger.info("=" * 50)
+    
+    if not TELEGRAM_TOKEN:
+        logger.error("❌❌❌ CRITICAL ERROR ❌❌❌")
+        logger.error("TELEGRAM_TOKEN is NOT set in environment variables!")
+        logger.error("Please add TELEGRAM_TOKEN to Railway variables")
+        logger.error("The bot will NOT work until this is fixed!")
+        logger.error("❌❌❌❌❌❌❌❌❌❌❌❌❌❌❌❌❌❌❌❌❌")
+    
+    logger.info(f"PORT: {PORT}")
+    logger.info(f"EXCHANGE_API_KEY: {EXCHANGE_API_KEY}")
+    logger.info(f"TELEGRAM_TOKEN: {'✅ SET' if TELEGRAM_TOKEN else '❌ NOT SET'}")
+    logger.info("=" * 50)
+    
+    app.run(host='0.0.0.0', port=PORT)
